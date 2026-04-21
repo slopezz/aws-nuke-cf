@@ -13,6 +13,7 @@ RUN dnf install -y \
         gawk \
         grep \
         findutils \
+        gnupg2 \
     && dnf clean all
 
 # AWS CLI v2
@@ -22,9 +23,12 @@ RUN arch=$(uname -m) && \
         aarch64) AWS_ARCH="aarch64" ;; \
     esac && \
     curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_ARCH}-${AWS_CLI_VERSION}.zip" -o "awscliv2.zip" && \
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_ARCH}-${AWS_CLI_VERSION}.zip.sig" -o "awscliv2.zip.sig" && \
+    gpg --keyserver keyserver.ubuntu.com --recv-keys FB5DB77FD5C118B80511ADA8A6310ACC4672475C && \
+    gpg --verify awscliv2.zip.sig awscliv2.zip && \
     unzip -qo awscliv2.zip && \
     ./aws/install && \
-    rm -rf awscliv2.zip ./aws && \
+    rm -rf awscliv2.zip awscliv2.zip.sig ./aws && \
     aws --version
 
 # aws-nuke v3 (checksum-verified)
@@ -42,3 +46,6 @@ RUN arch=$(uname -m) && \
     chmod +x /usr/local/bin/aws-nuke && \
     rm -f "${NUKE_TAR}" checksums.txt && \
     aws-nuke --version
+
+RUN useradd -r -s /sbin/nologin aws-nuke
+USER aws-nuke
