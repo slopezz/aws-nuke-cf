@@ -1,9 +1,9 @@
-FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:4a0b20f428991925e4599bc17a0bddc0a0a823606426860206f93d20b65af3fe
+FROM registry.access.redhat.com/ubi9/ubi@sha256:cf13fe2aba608ea76abcac5acb3fa4d88821416e7eb45e0623a62c948853ab84
 
 ARG AWS_NUKE_VERSION=3.64.1
 ARG AWS_CLI_VERSION=2.34.19
 
-RUN microdnf install -y \
+RUN dnf install -y \
         tar \
         gzip \
         unzip \
@@ -13,7 +13,7 @@ RUN microdnf install -y \
         gawk \
         grep \
         findutils \
-    && microdnf clean all
+    && dnf clean all
 
 # AWS CLI v2
 RUN arch=$(uname -m) && \
