@@ -1,0 +1,525 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Deploys a periodic aws-nuke job using CodeBuild and EventBridge.
+  Automatically injects self-protection filters to prevent the job from
+  deleting its own infrastructure. Defaults to dry-run mode.
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: aws-nuke
+    Description: Prefix for all resource names. Also used in self-protection filters.
+    AllowedPattern: ^[a-z][a-z0-9-]{1,20}$
+    ConstraintDescription: Lowercase alphanumeric with hyphens, 2-21 chars, starting with a letter.
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 3 ? * SUN *)
+    Description: >
+      EventBridge schedule expression (UTC). Examples: "cron(0 3 ? * SUN *)"
+      (Sundays at 3am), "cron(0 2 ? * MON-FRI *)" (weekdays at 2am),
+      "rate(1 day)" (every 24h).
+
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Whether the schedule is active.
+
+  DryRun:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      When true, aws-nuke lists resources but does NOT delete them.
+      Set to false to enable actual deletion. USE WITH CAUTION.
+
+  AwsNukeVersion:
+    Type: String
+    Default: v3.64.1
+    Description: >
+      aws-nuke release version to download (from github.com/ekristen/aws-nuke).
+      Check https://github.com/ekristen/aws-nuke/releases for available versions.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: CloudWatch Logs retention period in days.
+
+  BuildTimeoutMinutes:
+    Type: Number
+    Default: 120
+    MinValue: 5
+    MaxValue: 480
+    Description: CodeBuild timeout in minutes (max 480 / 8 hours).
+
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional email address for failure notifications. Leave empty to disable.
+      If provided, an SNS topic and subscription are created.
+
+# =============================================================================
+# Conditions
+# =============================================================================
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket — stores the user's aws-nuke config
+  # ---------------------------------------------------------------------------
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${NamePrefix}-config-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: aws-nuke:managed
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group — CodeBuild logs
+  # ---------------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${NamePrefix}-job
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: aws-nuke:managed
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # IAM Role — CodeBuild execution role (runs aws-nuke)
+  # ---------------------------------------------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${NamePrefix}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+      Tags:
+        - Key: aws-nuke:managed
+          Value: "true"
+
+  # CodeBuild supplemental permissions: logs + S3 config read
+  CodeBuildBasePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${NamePrefix}-codebuild-base
+      Roles: [!Ref CodeBuildRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !GetAtt LogGroup.Arn
+              - !Sub ${LogGroup.Arn}:*
+          - Sid: S3ConfigRead
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub ${ConfigBucket.Arn}/*
+          - Sid: S3ListBucket
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !GetAtt ConfigBucket.Arn
+          - Sid: CodeBuildReportBuildStatus
+            Effect: Allow
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:UpdateReport
+              - codebuild:BatchPutTestCases
+              - codebuild:BatchPutCodeCoverages
+            Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${NamePrefix}-*
+
+  # CRITICAL: Explicit deny on self-managed resources (defense in depth).
+  # Even if aws-nuke config filters fail, IAM prevents deletion.
+  SelfProtectionDenyPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${NamePrefix}-self-protection-deny
+      Roles: [!Ref CodeBuildRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyIAMSelf
+            Effect: Deny
+            Action: iam:*
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-*
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${NamePrefix}-*
+          - Sid: DenyS3Self
+            Effect: Deny
+            Action:
+              - s3:DeleteBucket
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${NamePrefix}-config-${AWS::AccountId}
+              - !Sub arn:${AWS::Partition}:s3:::${NamePrefix}-config-${AWS::AccountId}/*
+          - Sid: DenyCodeBuildSelf
+            Effect: Deny
+            Action:
+              - codebuild:DeleteProject
+              - codebuild:UpdateProject
+              - codebuild:StopBuild
+              - codebuild:BatchDeleteBuilds
+            Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${NamePrefix}-*
+          - Sid: DenyEventsSelf
+            Effect: Deny
+            Action:
+              - events:DeleteRule
+              - events:DisableRule
+              - events:RemoveTargets
+            Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${NamePrefix}-*
+          - Sid: DenyLogsSelf
+            Effect: Deny
+            Action:
+              - logs:DeleteLogGroup
+              - logs:DeleteLogStream
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${NamePrefix}-*
+          - Sid: DenySNSSelf
+            Effect: Deny
+            Action:
+              - sns:DeleteTopic
+              - sns:RemovePermission
+            Resource: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${NamePrefix}-*
+          - Sid: DenyCloudFormationSelf
+            Effect: Deny
+            Action:
+              - cloudformation:DeleteStack
+              - cloudformation:UpdateStack
+              - cloudformation:UpdateTerminationProtection
+            Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild Project — runs aws-nuke
+  # ---------------------------------------------------------------------------
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+      - CodeBuildBasePolicy
+      - SelfProtectionDenyPolicy
+    Properties:
+      Name: !Sub ${NamePrefix}-job
+      Description: Periodic aws-nuke job for account cleanup
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: !Ref BuildTimeoutMinutes
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: CONFIG_BUCKET
+            Value: !Ref ConfigBucket
+          - Name: STACK_NAME
+            Value: !Ref AWS::StackName
+          - Name: NAME_PREFIX
+            Value: !Ref NamePrefix
+          - Name: DRY_RUN
+            Value: !Ref DryRun
+          - Name: AWS_NUKE_VERSION
+            Value: !Ref AwsNukeVersion
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - |
+                  set -eo pipefail
+                  echo "=== Installing aws-nuke ${AWS_NUKE_VERSION} ==="
+                  ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+                  RELEASE_URL="https://github.com/ekristen/aws-nuke/releases/download/${AWS_NUKE_VERSION}"
+                  curl -sSfL "${RELEASE_URL}/aws-nuke-${AWS_NUKE_VERSION}-linux-${ARCH}.tar.gz" -o /tmp/aws-nuke.tar.gz
+                  curl -sSfL "${RELEASE_URL}/checksums.txt" -o /tmp/checksums.txt
+                  EXPECTED=$(grep "aws-nuke-${AWS_NUKE_VERSION}-linux-${ARCH}.tar.gz$" /tmp/checksums.txt | awk '{print $1}')
+                  echo "${EXPECTED}  /tmp/aws-nuke.tar.gz" | sha256sum -c -
+                  tar xzf /tmp/aws-nuke.tar.gz -C /usr/local/bin/
+                  chmod +x /usr/local/bin/aws-nuke
+                  aws-nuke --version
+                  cat > /tmp/prebuild.sh << 'PREBUILDEOF'
+                  #!/bin/bash
+                  set -e
+                  echo "=== Validating ==="
+                  ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+                  echo "Account: $ACCOUNT"
+                  ALIAS=$(aws iam list-account-aliases --query 'AccountAliases[0]' --output text 2>/dev/null || true)
+                  if [ -z "$ALIAS" ] || [ "$ALIAS" = "None" ]; then
+                    echo "ERROR: Account $ACCOUNT has no alias set."
+                    echo "aws-nuke requires an account alias. Set one with:"
+                    echo "  aws iam create-account-alias --account-alias my-sandbox"
+                    exit 1
+                  fi
+                  echo "Alias: $ALIAS"
+                  aws s3 cp "s3://${CONFIG_BUCKET}/nuke-config.yml" /tmp/user-config.yml --quiet
+                  if ! grep -q "$ACCOUNT" /tmp/user-config.yml; then
+                    echo "ERROR: Account $ACCOUNT not found in nuke config."
+                    echo "Add it to the 'accounts' section of your config."
+                    exit 1
+                  fi
+                  echo "=== Injecting self-protection ==="
+                  cp /tmp/user-config.yml /tmp/nuke-config.yml
+                  {
+                  echo '  _self_protection:'
+                  echo '    filters:'
+                  echo '      __global__:'
+                  echo '        - property: tag:aws-nuke:managed'
+                  echo '          value: "true"'
+                  echo '        - property: tag:aws:cloudformation:stack-name'
+                  echo "          value: \"$STACK_NAME\""
+                  echo '      IAMRole:'
+                  echo '        - type: glob'
+                  echo "          value: \"$NAME_PREFIX-*\""
+                  echo '      IAMRolePolicy:'
+                  echo '        - type: glob'
+                  echo "          value: \"$NAME_PREFIX-*\""
+                  echo '      IAMRolePolicyAttachment:'
+                  echo '        - type: glob'
+                  echo "          value: \"$NAME_PREFIX-*\""
+                  echo '      S3Bucket:'
+                  echo '        - type: glob'
+                  echo "          value: \"$NAME_PREFIX-config-*\""
+                  echo '      S3Object:'
+                  echo '        - property: Bucket'
+                  echo '          type: glob'
+                  echo "          value: \"$NAME_PREFIX-config-*\""
+                  echo '      CloudWatchLogsLogGroup:'
+                  echo '        - type: contains'
+                  echo "          value: \"/aws/codebuild/$NAME_PREFIX-\""
+                  echo '      CodeBuildProject:'
+                  echo '        - type: glob'
+                  echo "          value: \"$NAME_PREFIX-*\""
+                  echo '      CodeBuildBuild:'
+                  echo '        - type: glob'
+                  echo "          value: \"$NAME_PREFIX-*\""
+                  echo '      CloudWatchEventsRule:'
+                  echo '        - property: Name'
+                  echo '          type: glob'
+                  echo "          value: \"$NAME_PREFIX-*\""
+                  echo '      CloudWatchEventsTarget:'
+                  echo '        - type: glob'
+                  echo "          value: \"Rule: $NAME_PREFIX-*\""
+                  echo '      SNSTopic:'
+                  echo '        - type: glob'
+                  echo "          value: \"$NAME_PREFIX-*\""
+                  echo '      SNSSubscription:'
+                  echo '        - type: glob'
+                  echo "          value: \"$NAME_PREFIX-*\""
+                  echo '      CloudFormationStack:'
+                  echo '        - type: exact'
+                  echo "          value: \"$STACK_NAME\""
+                  } > /tmp/_protection.yml
+                  if grep -q '^presets:' /tmp/nuke-config.yml; then
+                    sed -i '/^presets:/r /tmp/_protection.yml' /tmp/nuke-config.yml
+                  else
+                    printf '\npresets:\n' >> /tmp/nuke-config.yml
+                    cat /tmp/_protection.yml >> /tmp/nuke-config.yml
+                  fi
+                  awk '/^[[:space:]]+presets:.*\[/ {
+                    sub(/\]/, ", _self_protection]")
+                    print
+                    next
+                  }
+                  /^[[:space:]]+presets:/ {
+                    print
+                    indent = $0; sub(/presets:.*/, "", indent)
+                    print indent "  - _self_protection"
+                    next
+                  } { print }' /tmp/nuke-config.yml > /tmp/nuke-config.tmp && mv /tmp/nuke-config.tmp /tmp/nuke-config.yml
+                  echo "Self-protection injected. Config ready."
+                  PREBUILDEOF
+                  cat > /tmp/build.sh << 'BUILDEOF'
+                  #!/bin/bash
+                  FLAGS="--no-prompt --prompt-delay 3"
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "=== DRY RUN ==="
+                  else
+                    FLAGS="$FLAGS --no-dry-run"
+                    echo "=== LIVE MODE — resources WILL be deleted ==="
+                  fi
+                  aws-nuke run --config /tmp/nuke-config.yml $FLAGS
+                  BUILDEOF
+                  chmod +x /tmp/prebuild.sh /tmp/build.sh
+            pre_build:
+              commands:
+                - bash /tmp/prebuild.sh
+            build:
+              commands:
+                - bash /tmp/build.sh
+      Artifacts:
+        Type: NO_ARTIFACTS
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref LogGroup
+      Tags:
+        - Key: aws-nuke:managed
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # IAM Role — EventBridge to trigger CodeBuild
+  # ---------------------------------------------------------------------------
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${NamePrefix}-eventbridge-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${NamePrefix}-start-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+      Tags:
+        - Key: aws-nuke:managed
+          Value: "true"
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Rule — scheduled trigger
+  # ---------------------------------------------------------------------------
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${NamePrefix}-schedule
+      Description: !Sub Triggers ${NamePrefix}-job on a schedule
+      ScheduleExpression: !Ref ScheduleExpression
+      State: !Ref ScheduleState
+      Targets:
+        - Arn: !GetAtt CodeBuildProject.Arn
+          Id: !Sub ${NamePrefix}-codebuild-target
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # SNS — failure notifications (conditional)
+  # ---------------------------------------------------------------------------
+  FailureNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub ${NamePrefix}-failures
+      Tags:
+        - Key: aws-nuke:managed
+          Value: "true"
+
+  FailureNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref FailureNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  FailureNotificationRule:
+    Type: AWS::Events::Rule
+    Condition: HasNotificationEmail
+    Properties:
+      Name: !Sub ${NamePrefix}-failure-alert
+      Description: Alerts on aws-nuke build failures
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        detail:
+          project-name:
+            - !Ref CodeBuildProject
+          build-status:
+            - FAILED
+            - STOPPED
+      Targets:
+        - Arn: !Ref FailureNotificationTopic
+          Id: !Sub ${NamePrefix}-failure-sns
+
+  FailureNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasNotificationEmail
+    Properties:
+      Topics: [!Ref FailureNotificationTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref FailureNotificationTopic
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  ConfigBucketName:
+    Description: S3 bucket for the aws-nuke configuration file. Upload your nuke-config.yml here.
+    Value: !Ref ConfigBucket
+
+  CodeBuildProjectName:
+    Description: CodeBuild project name. Use for manual triggers.
+    Value: !Ref CodeBuildProject
+
+  LogGroupName:
+    Description: CloudWatch Log Group for build logs.
+    Value: !Ref LogGroup
+
+  CodeBuildRoleArn:
+    Description: IAM role ARN used by the CodeBuild project (for auditing).
+    Value: !GetAtt CodeBuildRole.Arn
+
+  ManualRunCommand:
+    Description: AWS CLI command to manually trigger a build.
+    Value: !Sub aws codebuild start-build --project-name ${CodeBuildProject}
+
+  FailureTopicArn:
+    Condition: HasNotificationEmail
+    Description: SNS topic ARN for failure notifications.
+    Value: !Ref FailureNotificationTopic

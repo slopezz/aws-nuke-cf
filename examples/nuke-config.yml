@@ -1,0 +1,88 @@
+# aws-nuke configuration
+# Full docs: https://ekristen.github.io/aws-nuke/config/
+#
+# IMPORTANT:
+#   - You do NOT need to add self-protection filters here. The deployment
+#     automatically injects a "_self_protection" preset at runtime that
+#     prevents aws-nuke from deleting its own infrastructure.
+#   - The "blocklist" MUST contain at least one account ID (e.g. your prod account).
+#   - The target account MUST have an account alias configured.
+#     Set one with: aws iam create-account-alias --account-alias my-sandbox
+
+# Accounts that should NEVER be nuked (hard block).
+# aws-nuke aborts immediately if it detects it's running against a blocklisted account.
+blocklist:
+  - "999999999999"  # Replace with your production account ID
+
+# Regions to scan. Use "global" for IAM, Route53, and other global services.
+regions:
+  - us-east-1
+  - us-west-2
+  - eu-west-1
+  - global
+
+# Optional: restrict which resource types aws-nuke will target.
+# If "includes" is set, ONLY those types are scanned. If omitted, all types are scanned.
+# resource-types:
+#   includes:
+#     - EC2Instance
+#     - EC2SecurityGroup
+#     - EC2Volume
+#     - S3Bucket
+#     - S3Object
+#     - LambdaFunction
+#     - CloudFormationStack
+#     - ECSCluster
+
+# Presets let you define reusable filter groups.
+# The "_self_protection" preset is auto-injected at runtime — do not define it here.
+presets:
+  common_excludes:
+    filters:
+      # Keep AWS SSO / Identity Center roles
+      IAMRole:
+        - type: glob
+          value: "AWSReservedSSO_*"
+        - type: glob
+          value: "aws-service-role/*"
+        - type: glob
+          value: "OrganizationAccountAccessRole"
+      IAMRolePolicy:
+        - type: glob
+          value: "AWSReservedSSO_*"
+      IAMRolePolicyAttachment:
+        - type: glob
+          value: "AWSReservedSSO_*"
+        - type: glob
+          value: "aws-service-role/*"
+      # Keep default VPC resources
+      EC2DefaultSecurityGroupRule:
+        - type: glob
+          value: "*"
+      EC2DHCPOption:
+        - type: glob
+          value: "*"
+      # Keep CloudFormation stacks managing infrastructure
+      # (remove this filter if you want to nuke CF stacks too)
+      CloudFormationStack:
+        - type: glob
+          value: "*"
+
+# Per-account configuration.
+# Replace "123456789012" with your actual target account ID.
+accounts:
+  "123456789012":
+    presets:
+      - common_excludes
+      # "_self_protection" is auto-injected here at runtime
+    filters:
+      # Add account-specific exclusions here.
+      # Example: keep a specific EC2 instance
+      # EC2Instance:
+      #   - property: tag:Name
+      #     value: "my-important-instance"
+      #
+      # Example: keep S3 buckets matching a pattern
+      # S3Bucket:
+      #   - type: glob
+      #     value: "my-company-important-*"
