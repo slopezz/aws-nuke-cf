@@ -37,12 +37,11 @@ Parameters:
       When true, aws-nuke lists resources but does NOT delete them.
       Set to false to enable actual deletion. USE WITH CAUTION.
 
-  AwsNukeVersion:
+  ContainerImage:
     Type: String
-    Default: v3.64.1
+    Default: quay.io/rrp-dev-ci/ci-image:latest
     Description: >
-      aws-nuke release version to download (from github.com/ekristen/aws-nuke).
-      Check https://github.com/ekristen/aws-nuke/releases for available versions.
+      Container image with aws-nuke and AWS CLI pre-installed.
 
   LogRetentionDays:
     Type: Number
@@ -248,7 +247,8 @@ Resources:
       Environment:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Image: !Ref ContainerImage
+        ImagePullCredentialsType: CODEBUILD
         EnvironmentVariables:
           - Name: CONFIG_BUCKET
             Value: !Ref ConfigBucket
@@ -258,8 +258,6 @@ Resources:
             Value: !Ref NamePrefix
           - Name: DRY_RUN
             Value: !Ref DryRun
-          - Name: AWS_NUKE_VERSION
-            Value: !Ref AwsNukeVersion
       Source:
         Type: NO_SOURCE
         BuildSpec: |
@@ -269,15 +267,6 @@ Resources:
               commands:
                 - |
                   set -eo pipefail
-                  echo "=== Installing aws-nuke ${AWS_NUKE_VERSION} ==="
-                  ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
-                  RELEASE_URL="https://github.com/ekristen/aws-nuke/releases/download/${AWS_NUKE_VERSION}"
-                  curl -sSfL "${RELEASE_URL}/aws-nuke-${AWS_NUKE_VERSION}-linux-${ARCH}.tar.gz" -o /tmp/aws-nuke.tar.gz
-                  curl -sSfL "${RELEASE_URL}/checksums.txt" -o /tmp/checksums.txt
-                  EXPECTED=$(grep "aws-nuke-${AWS_NUKE_VERSION}-linux-${ARCH}.tar.gz$" /tmp/checksums.txt | awk '{print $1}')
-                  echo "${EXPECTED}  /tmp/aws-nuke.tar.gz" | sha256sum -c -
-                  tar xzf /tmp/aws-nuke.tar.gz -C /usr/local/bin/
-                  chmod +x /usr/local/bin/aws-nuke
                   aws-nuke --version
                   cat > /tmp/prebuild.sh << 'PREBUILDEOF'
                   #!/bin/bash
